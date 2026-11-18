@@ -33,7 +33,7 @@ jobs:
           targets: ${{ matrix.target }}
       - if: runner.os == 'Linux'
         run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
-      - run: cargo build --release --locked -p halda-open --target "$TARGET"
+      - run: cargo build --release --locked -p halda --target "$TARGET"
         env:
           TARGET: ${{ matrix.target }}
       - name: Package
