@@ -1,0 +1,27 @@
+[package]
+name = "halda"
+description = "Halda's free, open-source tool: finds the AI agents and add-ons on a machine, tests what a hijacked agent could get out, and replays what agents did."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Named halda-open here so it does not collide with the full `halda` binary. The
+# public repository builds it as `halda`.
+[[bin]]
+name = "halda"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+ureq.workspace = true
+halda-scan.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
