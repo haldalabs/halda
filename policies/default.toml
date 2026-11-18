@@ -1,0 +1,220 @@
+# Halda default policy.
+#
+# Rules are checked top to bottom. For each simulated effect the first matching
+# rule applies, and the most severe result across all effects wins.
+#
+# Verdicts: allow, fix, ask, retry, block.
+# An effect no rule covers gets `default_effect_verdict`, which cannot be lower
+# than `ask`. Some protections live in the core and cannot be turned off here:
+# forbidden actions, the kill switch, and treating unsimulated actions as `ask`.
+
+version = 1
+mode = "enforce"
+default_effect_verdict = "ask"
+
+# Tools Halda cannot judge by name. `halda replay` lists the ones you use most.
+# Example: trusted_tools = ["mcp__notion__*"]
+trusted_tools = []
+
+[approvals]
+ttl_minutes = 15
+allow_self_approval = false
+approvers = []
+
+[watcher]
+max_repeat_refusals = 10
+max_session_refusals = 30
+
+# ---- Promises ----
+#
+# Things that must never happen, whatever a rule below allows. A promise is
+# broken when every item in `when` matches an effect of the same action, so it
+# can see combinations that a rule, which judges one effect at a time, cannot.
+# Approvers see the promise id and its text. Write your own in the same form.
+
+[[promise]]
+id = "P-DATA-1"
+text = "A production data store and its backups are never destroyed in the same action."
+verdict = "block"
+when = [
+  { verb = ["delete", "replace"], kind = ["database", "volume", "bucket", "table-store"], environment = ["production"] },
+  { verb = ["delete"], kind = ["snapshot"] },
+]
+
+[[promise]]
+id = "P-DATA-2"
+text = "No single action deletes or rewrites 100,000 or more rows in production."
+verdict = "block"
+when = [
+  { verb = ["delete", "modify"], kind = ["rows"], environment = ["production"], min_count = 100000 },
+]
+
+[[promise]]
+id = "P-GIT-1"
+text = "Commits on main or master are never removed from the shared copy."
+verdict = "block"
+when = [
+  { verb = ["delete"], kind = ["commit", "branch"], target = ["main", "master"] },
+]
+
+# ---- Action-level rules, driven by what the analyzer found ----
+
+[[rule]]
+id = "secrets.redact-outbound"
+signal = "secret.in_outbound_payload"
+verdict = "fix"
+reason = "A secret in this outbound payload was redacted before sending."
+
+[[rule]]
+id = "memory.poisoned-write"
+signal = "memory.injection"
+verdict = "block"
+reason = "This write to shared agent memory contains instructions aimed at future agents."
+
+[[rule]]
+id = "git.force-push-shared"
+signal = "git.force_push"
+verdict = "ask"
+reason = "A force-push rewrites shared history."
+
+# ---- Infrastructure ----
+
+[[rule]]
+id = "infra.delete-data-store"
+verb = ["delete", "replace"]
+kind = ["database", "snapshot", "bucket", "volume", "table-store"]
+environment = ["production"]
+verdict = "ask"
+reason = "This destroys a production data store."
+
+[[rule]]
+id = "infra.delete-data-store-nonprod"
+verb = ["delete", "replace"]
+kind = ["database", "snapshot", "bucket", "volume", "table-store"]
+environment = ["nonproduction"]
+irreversible = false
+verdict = "allow"
+reason = "Recoverable change to a non-production data store."
+
+[[rule]]
+id = "infra.delete-production"
+verb = ["delete", "replace"]
+environment = ["production"]
+domain = ["terraform", "cloud"]
+verdict = "ask"
+reason = "This destroys production infrastructure."
+
+[[rule]]
+id = "infra.additive"
+verb = ["create"]
+domain = ["terraform", "cloud"]
+verdict = "allow"
+reason = "Only adds new infrastructure."
+
+# ---- Databases ----
+
+[[rule]]
+id = "db.drop-table"
+verb = ["delete"]
+kind = ["table", "schema", "column"]
+domain = ["sql"]
+verdict = "ask"
+reason = "This removes database structure and the data in it."
+
+[[rule]]
+id = "db.mass-delete"
+verb = ["delete", "modify"]
+kind = ["rows"]
+domain = ["sql"]
+min_count = 1000
+verdict = "ask"
+reason = "This changes a large number of rows."
+
+[[rule]]
+id = "db.small-change"
+verb = ["delete", "modify"]
+kind = ["rows"]
+domain = ["sql"]
+max_count = 999
+environment = ["nonproduction"]
+verdict = "allow"
+reason = "Small data change outside production."
+
+[[rule]]
+id = "db.small-change-production"
+verb = ["delete", "modify"]
+kind = ["rows"]
+domain = ["sql"]
+max_count = 999
+verdict = "ask"
+reason = "Data change in production."
+
+[[rule]]
+id = "db.additive-schema"
+verb = ["create", "modify"]
+kind = ["table", "column", "index"]
+domain = ["sql"]
+irreversible = false
+verdict = "allow"
+reason = "Additive schema change. The simulation shows no data touched."
+
+# ---- Git ----
+
+[[rule]]
+id = "git.history-loss"
+verb = ["delete"]
+kind = ["commit", "branch"]
+domain = ["git"]
+verdict = "ask"
+reason = "This removes commits from a shared branch."
+
+[[rule]]
+id = "git.additive"
+verb = ["create"]
+kind = ["commit", "branch"]
+domain = ["git"]
+verdict = "allow"
+reason = "Only adds commits. Nothing on the remote is lost."
+
+# ---- Money ----
+
+[[rule]]
+id = "money.any-movement"
+verb = ["charge"]
+verdict = "ask"
+reason = "This moves money."
+
+[[rule]]
+id = "saas.destructive"
+verb = ["delete"]
+domain = ["stripe", "github"]
+verdict = "ask"
+reason = "This deletes data in a business system."
+
+# ---- Local files ----
+
+[[rule]]
+id = "files.in-workspace"
+verb = ["create", "modify"]
+kind = ["file"]
+domain = ["shell", "file"]
+verdict = "allow"
+reason = "Changes files in the working copy only."
+
+[[rule]]
+id = "files.small-delete"
+verb = ["delete"]
+kind = ["file"]
+domain = ["shell", "file"]
+max_count = 50
+irreversible = false
+verdict = "allow"
+reason = "Removes a few files that version control can restore."
+
+[[rule]]
+id = "files.mass-delete"
+verb = ["delete"]
+kind = ["file"]
+domain = ["shell", "file"]
+verdict = "ask"
+reason = "This deletes files that cannot easily be recovered."

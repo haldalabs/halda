@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "Apache-2.0"
+publish = false
+repository = "https://github.com/haldalabs/halda"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+dbg_macro = "deny"
+todo = "deny"
+
+[workspace.dependencies]
+halda-core = { path = "crates/halda-core" }
+halda-analyze = { path = "crates/halda-analyze" }
+halda-scan = { path = "crates/halda-scan" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+hex = "0.4"
+proptest = "1"
+rand = "0.8"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+sqlparser = "0.52"
+tempfile = "3"
+thiserror = "2"
+toml = "0.8"
+ureq = { version = "2", features = ["json"] }
+walkdir = "2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = "symbols"
+panic = "abort"

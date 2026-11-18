@@ -1,0 +1,103 @@
+name: Release
+
+# Run by hand from main with a version such as v0.1.0: it builds, proves the
+# builds install and run on a machine with no Rust setup, then tags that commit
+# and publishes the release. A change to this file or to the installer runs the
+# same proof without publishing.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish, such as v0.1.0"
+        required: true
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - install.sh
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both Mac builds share one Intel Mac. Apple silicon runners are short on
+        # capacity and new organizations get few Mac runners, so a second Mac job
+        # can wait until it is cancelled. The Intel Mac builds both and test-installs
+        # the Intel one. CI runs the tests on Apple silicon from source.
+        include:
+          - { os: macos-26-intel, name: macos, targets: aarch64-apple-darwin x86_64-apple-darwin }
+          - { os: ubuntu-latest, name: linux-x86_64, targets: x86_64-unknown-linux-musl }
+          - { os: ubuntu-24.04-arm, name: linux-aarch64, targets: aarch64-unknown-linux-musl }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
+      - name: Build and package
+        env:
+          TARGETS: ${{ matrix.targets }}
+        run: |
+          mkdir -p dist
+          for target in $TARGETS; do
+            rustup target add "$target"
+            cargo build --release --locked -p halda --target "$target"
+            tar -czf "dist/halda-$target.tar.gz" -C "target/$target/release" halda
+          done
+          ls -l dist
+      # Installs from the checksummed files, as a new user would, and runs the
+      # tool, on the machine that built it. One Mac per release is all a new
+      # organization can count on getting.
+      - name: A wrong checksum installs nothing
+        run: |
+          mkdir bad && cp dist/* bad/
+          (cd bad && if command -v sha256sum > /dev/null; then sha256sum * > SHA256SUMS; else shasum -a 256 * > SHA256SUMS; fi)
+          for f in bad/*.tar.gz; do echo x >> "$f"; done
+          if HALDA_FROM=bad HALDA_INSTALL_DIR="$PWD/nope" sh install.sh; then exit 1; fi
+          test ! -e nope/halda
+      - name: Install and run with no Rust on the path
+        run: |
+          mkdir good && cp dist/* good/
+          (cd good && if command -v sha256sum > /dev/null; then sha256sum * > SHA256SUMS; else shasum -a 256 * > SHA256SUMS; fi)
+          HALDA_FROM=good HALDA_INSTALL_DIR="$PWD/installed" sh install.sh
+          export PATH="$PWD/installed:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin"
+          halda --version
+          halda scan > /dev/null
+          halda map
+          halda exposure
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: halda-${{ matrix.name }}
+          path: dist/*
+
+  publish:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - run: cd dist && sha256sum * > SHA256SUMS
+      # Provenance needs a public repository on this plan.
+      - if: ${{ !github.event.repository.private }}
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*
+      - name: Tag this commit and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          case "$VERSION" in v[0-9]*.[0-9]*.[0-9]*) ;; *) echo "not a version: $VERSION" >&2; exit 1 ;; esac
+          gh release create "$VERSION" dist/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --generate-notes --prerelease
