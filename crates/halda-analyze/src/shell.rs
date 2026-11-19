@@ -136,10 +136,12 @@ impl Reader<'_> {
             Some('(') => {
                 self.bump();
                 if self.peek() == Some('(') {
-                    // Arithmetic: not a command, but a value we cannot know.
+                    // Arithmetic: a value we cannot know, and bash and zsh run any
+                    // `$(cmd)` or backtick command inside it: `$(( $(rm -rf ~) ))`.
                     self.bump();
                     let body = self.read_balanced();
                     self.bump();
+                    self.out.substitutions.extend(hidden_commands(&body));
                     word.text.push_str(&format!("$(({body}))"));
                 } else {
                     let body = self.read_balanced();
@@ -173,17 +175,8 @@ impl Reader<'_> {
                 if name.ends_with("@P") || name.ends_with("@E") {
                     self.fail("parameter transformation that can run commands");
                 }
-                // ${X:-$(cmd)} and friends hide commands inside the braces.
-                if let Some(start) = name.find("$(") {
-                    let mut inner = Parsed::default();
-                    let mut sub = Reader {
-                        chars: name[start + 2..].chars().collect(),
-                        pos: 0,
-                        out: &mut inner,
-                    };
-                    let body = sub.read_balanced();
-                    self.out.substitutions.push(body);
-                }
+                // ${X:-$(cmd)}, ${X:-`cmd`} and friends hide commands inside the braces.
+                self.out.substitutions.extend(hidden_commands(&name));
                 word.text.push_str(&format!("${{{name}}}"));
             }
             Some('\'') => {
@@ -727,6 +720,47 @@ pub fn all_commands(input: &str, depth: usize) -> (Vec<Command>, bool, Option<St
         }
     }
     (commands, unparsable, problem)
+}
+
+/// Every command a piece of expansion text would run: each `$(cmd)` and
+/// `` `cmd` `` inside it, including those inside arithmetic. Used where the
+/// parser reads text as a value, such as `${x:-...}` and `$((...))`.
+fn hidden_commands(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut found = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '`' => {
+                let end = chars[i + 1..].iter().position(|c| *c == '`');
+                let body: String = match end {
+                    Some(n) => chars[i + 1..i + 1 + n].iter().collect(),
+                    None => chars[i + 1..].iter().collect(),
+                };
+                i += body.chars().count() + 2;
+                found.push(body);
+            }
+            '$' if chars.get(i + 1) == Some(&'(') => {
+                let arithmetic = chars.get(i + 2) == Some(&'(');
+                let start = i + if arithmetic { 3 } else { 2 };
+                let mut inner = Parsed::default();
+                let mut reader = Reader {
+                    chars: chars[start..].to_vec(),
+                    pos: 0,
+                    out: &mut inner,
+                };
+                let body = reader.read_balanced();
+                i = start + reader.pos + usize::from(arithmetic);
+                if arithmetic {
+                    found.extend(hidden_commands(&body));
+                } else {
+                    found.push(body);
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    found
 }
 
 #[cfg(test)]

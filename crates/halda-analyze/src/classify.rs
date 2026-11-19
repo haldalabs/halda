@@ -271,9 +271,15 @@ fn first_positional(args: &[Word]) -> Option<&str> {
 }
 
 fn all_relative_inside(args: &[Word], cwd: &str) -> bool {
-    args.iter()
-        .filter(|w| !w.text.starts_with('-'))
-        .all(|w| !w.dynamic && paths::inside_workspace(&w.text, cwd))
+    args.iter().all(|w| {
+        let path = match w.text.split_once('=') {
+            // `--target-directory=~/Library/LaunchAgents` names a path too.
+            Some((option, value)) if option.starts_with("--") => value,
+            _ if w.text.starts_with('-') => return true,
+            _ => w.text.as_str(),
+        };
+        !w.dynamic && paths::inside_workspace(path, cwd)
+    })
 }
 
 /// Analyzes a whole shell command line.
@@ -894,7 +900,7 @@ impl<'a> Context<'a> {
             | "bundle" | "rake" | "rspec" | "make" | "just" | "cmake" | "ninja" | "vitest"
             | "jest" => dev_tool(name, args),
             n if INTERPRETERS.contains(&n) => interpreter(n, args),
-            n if READ_ONLY.contains(&n) => Finding::safe(),
+            n if READ_ONLY.contains(&n) => read_only_tool(n, args),
             "halda" => halda_cli(args),
             other => Finding::ambiguous(
                 "shell.unknown_command",
@@ -1133,6 +1139,12 @@ fn strip_wrapper_options(name: &str, args: &[Word]) -> Vec<Word> {
         "watch" => &["-n", "-d"],
         "env" => &["-u", "-C", "-S"],
         "stdbuf" => &["-i", "-o", "-e"],
+        // `exec -a NAME cmd` and `time -o FILE cmd`: without these, the value
+        // was read as the command (`exec -a ls rm -rf ~` looked like `ls`).
+        "exec" => &["-a"],
+        "time" => &["-o", "-f", "--output", "--format"],
+        "caffeinate" => &["-t", "-w"],
+        "script" => &["-c", "-t", "-T", "-I", "-O", "-B", "-E", "-F"],
         _ => &[],
     };
     while i < args.len() {
@@ -1695,6 +1707,29 @@ fn aws(args: &[Word]) -> Finding {
         );
     }
     let decrypts = args.iter().any(|a| a.text == "--with-decryption");
+    // A parameter named like a secret is often stored as plain text, which
+    // `get-parameter` returns without `--with-decryption`.
+    let secret_named = args.iter().any(|a| {
+        let t = a.text.to_ascii_lowercase();
+        !t.starts_with('-')
+            && [
+                "password",
+                "passwd",
+                "secret",
+                "token",
+                "apikey",
+                "api_key",
+                "api-key",
+                "private",
+                "credential",
+            ]
+            .iter()
+            .any(|w| t.contains(w))
+    });
+    let user_data = args.iter().any(|a| {
+        a.text.eq_ignore_ascii_case("userData")
+            || a.text.eq_ignore_ascii_case("--attribute=userData")
+    });
     if matches!(
         (service, op),
         (
@@ -1704,7 +1739,9 @@ fn aws(args: &[Word]) -> Finding {
             | ("ecr" | "ecr-public", "get-login-password")
             | ("codeartifact", "get-authorization-token")
             | ("eks", "get-token")
-    ) || (service == "ssm" && op.starts_with("get-parameter") && decrypts)
+    ) || (service == "ssm" && op.starts_with("get-parameter") && (decrypts || secret_named))
+        || (service == "ec2" && op == "describe-instance-attribute" && user_data)
+        || (service == "ec2" && op == "get-password-data")
     {
         return Finding::secret_read(format!(
             "`aws {service} {op}` prints a secret or a credential"
@@ -2082,12 +2119,115 @@ fn permissions(name: &str, args: &[Word]) -> Finding {
     )
 }
 
+/// A tool that only reads, unless one of its flags runs a program, writes a file
+/// or prints the environment. Those flags are what an attacker reaches for, so
+/// the name alone is not enough.
+fn read_only_tool(name: &str, args: &[Word]) -> Finding {
+    let words = texts(args);
+    let flag = |long: &[&str], short: &[&str]| {
+        words.iter().any(|w| {
+            long.iter()
+                .any(|l| *w == *l || w.starts_with(&format!("{l}=")))
+                || short.contains(w)
+        })
+    };
+    match name {
+        "fd" | "fdfind" if flag(&["--exec", "--exec-batch"], &["-x", "-X"]) => Finding::ambiguous(
+            "shell.exec_flag",
+            "`fd -x` runs a program on every file it finds",
+        ),
+        "bat" | "batcat" if flag(&["--pager"], &[]) => {
+            Finding::ambiguous("shell.exec_flag", "`bat --pager` runs a program")
+        }
+        "less" | "more" | "most" if flag(&["--lesskey-file"], &[]) => Finding::ambiguous(
+            "shell.exec_flag",
+            format!("`{name}` with a key file can run commands"),
+        ),
+        "tree" if flag(&["--output"], &["-o"]) => {
+            Finding::ambiguous("file.write", "`tree -o` writes a file")
+        }
+        "jq" | "gojq" | "yq" | "jaq"
+            if words.iter().any(|w| {
+                !w.starts_with('-')
+                    && (*w == "env"
+                        || w.contains("$ENV")
+                        || w.contains("env.")
+                        || w.contains("env|")
+                        || w.contains("env |"))
+            }) =>
+        {
+            Finding::secret_read(format!(
+                "`{name}` printing the environment, which can hold keys"
+            ))
+        }
+        "yq" if flag(&["--inplace"], &["-i"]) => {
+            Finding::ambiguous("file.write", "`yq -i` edits files")
+        }
+        _ => Finding::safe(),
+    }
+}
+
+/// True if a sed script runs a command (`e`, or the `e` flag of `s`) or writes a
+/// file (`w`, `W`, or the `w` flag of `s`), whatever the delimiter or address.
+fn sed_script_runs_or_writes(script: &str) -> bool {
+    for command in script.split([';', '\n']) {
+        let mut rest = command.trim_start();
+        // Skip an address: line numbers, `$`, ranges, steps, and /regex/ forms.
+        loop {
+            let before = rest;
+            rest = rest.trim_start_matches(|c: char| {
+                c.is_ascii_digit() || matches!(c, '$' | ',' | '~' | '!' | '+' | ' ')
+            });
+            if let Some(after) = rest.strip_prefix('/') {
+                rest = after.split_once('/').map_or("", |(_, r)| r);
+            }
+            if rest == before {
+                break;
+            }
+        }
+        let rest = rest.trim_start_matches('{').trim_start();
+        let mut chars = rest.chars();
+        match chars.next() {
+            Some('e' | 'w' | 'W') => return true,
+            Some('s') => {
+                if let Some(delimiter) = chars.next() {
+                    if delimiter.is_alphanumeric() || delimiter.is_whitespace() {
+                        continue;
+                    }
+                    let parts: Vec<&str> = rest[1 + delimiter.len_utf8()..]
+                        .splitn(3, delimiter)
+                        .collect();
+                    if parts.len() == 3 {
+                        let flags: String = parts[2]
+                            .chars()
+                            .take_while(|c| c.is_alphanumeric())
+                            .collect();
+                        if flags.contains('e') || flags.contains('w') {
+                            return true;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 fn find(args: &[Word]) -> Finding {
     let words = texts(args);
     if words.iter().any(|w| {
         matches!(
             *w,
-            "-delete" | "-exec" | "-execdir" | "-ok" | "-okdir" | "-fprint" | "-fprintf" | "-fls"
+            "-delete"
+                | "-exec"
+                | "-execdir"
+                | "-ok"
+                | "-okdir"
+                | "-fprint"
+                | "-fprint0"
+                | "-fprintf"
+                | "-fls"
         )
     }) {
         if words.iter().any(|w| paths::is_agent_config(w)) {
@@ -2111,13 +2251,16 @@ fn sed(args: &[Word]) -> Finding {
         return Finding::ambiguous("file.write", "`sed -i` edits files");
     }
     // The `e` command and `w` file writes run or create things.
-    if args.iter().any(|a| {
-        !a.text.starts_with('-')
-            && (a.text.contains("/e")
-                || a.text.contains(" w ")
-                || a.text.starts_with("e ")
-                || a.text.starts_with('e') && a.text.len() < 3)
-    }) {
+    if has_flag(args, &["--file"], 'f')
+        || args.iter().any(|a| {
+            !a.text.starts_with('-')
+                && (a.text.contains("/e")
+                    || a.text.contains(" w ")
+                    || a.text.starts_with("e ")
+                    || a.text.starts_with('e') && a.text.len() < 3
+                    || sed_script_runs_or_writes(&a.text))
+        })
+    {
         return Finding::ambiguous(
             "shell.sed_exec",
             "`sed` script that can run commands or write files",
@@ -2296,7 +2439,15 @@ fn interpreter(name: &str, args: &[Word]) -> Finding {
             .iter()
             .find(|a| !a.text.starts_with('-'))
             .map_or("", |a| a.text.as_str());
-        if !program.contains("system")
+        if program.contains("ENVIRON") || program.contains("PROCINFO") {
+            return Finding::secret_read("`awk` printing the environment, which can hold keys");
+        }
+        // A program read from a file is a program Halda has not seen.
+        let from_file = args
+            .iter()
+            .any(|a| a.text == "-f" || a.text.starts_with("--file") || a.text.starts_with("-f"));
+        if !from_file
+            && !program.contains("system")
             && !program.contains('|')
             && !program.contains('>')
             && !program.contains("getline")

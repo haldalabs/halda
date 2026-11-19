@@ -467,7 +467,7 @@ dependencies = [
 
 [[package]]
 name = "halda"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -479,7 +479,7 @@ dependencies = [
 
 [[package]]
 name = "halda-analyze"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "halda-core",
  "proptest",
@@ -492,7 +492,7 @@ dependencies = [
 
 [[package]]
 name = "halda-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ed25519-dalek",
  "hex",
@@ -508,7 +508,7 @@ dependencies = [
 
 [[package]]
 name = "halda-scan"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "halda-analyze",
  "halda-core",

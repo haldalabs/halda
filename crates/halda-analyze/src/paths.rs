@@ -92,15 +92,118 @@ pub fn is_agent_config(text: &str) -> bool {
     agent_config_re().is_match(text)
 }
 
-fn is_harmless(text: &str) -> bool {
-    // Only exempt when nothing sensitive remains once the harmless names are gone.
-    let stripped = harmless_re().replace_all(text, "");
-    !sensitive_re().is_match(&stripped)
+/// Directories whose contents are credentials, matched as path components so a
+/// glob (`~/.aws/cred*`), a whole-directory read (`grep -r . ~/.aws`) or an
+/// unlisted file name inside them is still seen.
+const SECRET_DIRS: &[&[&str]] = &[
+    &[".aws"],
+    &[".ssh"],
+    &[".gnupg"],
+    &[".azure"],
+    &[".databricks"],
+    &[".terraform.d"],
+    &[".kube"],
+    &[".docker"],
+    &[".password-store"],
+    &[".config", "gcloud"],
+    &[".config", "gh"],
+    &[".config", "rclone"],
+    &[".config", "firebase"],
+    &[".config", "hub"],
+    &[".config", "op"],
+    &[".config", "doctl"],
+    &[".config", "heroku"],
+];
+
+/// File names that hold credentials wherever they are.
+const SECRET_NAMES: &[&str] = &[
+    ".my.cnf",
+    ".boto",
+    ".s3cfg",
+    ".pgpass",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    ".git-credentials",
+    ".vault-token",
+    ".dockercfg",
+    "rclone.conf",
+    "accesstokens.json",
+    "msal_token_cache.json",
+    "credentials.tfrc.json",
+    "key.json",
+];
+
+/// Extensions a credential file plausibly has. `credentials_test.rs` is code, not
+/// a credential.
+const DATA_EXTENSIONS: &[&str] = &[
+    "", "json", "yml", "yaml", "toml", "txt", "ini", "cfg", "conf", "xml", "csv", "db",
+];
+
+fn component_is_secret(token: &str) -> bool {
+    let token = token.trim_matches(|c: char| c == '\'' || c == '"' || c == '`');
+    if token.is_empty() {
+        return false;
+    }
+    let lower = token.to_ascii_lowercase();
+    if lower.starts_with("/proc/") && lower.ends_with("/environ") {
+        return true;
+    }
+    let parts: Vec<&str> = lower
+        .split('/')
+        .filter(|p| !p.is_empty() && *p != "." && *p != "~")
+        .collect();
+    let in_secret_dir = SECRET_DIRS.iter().any(|dir| {
+        parts
+            .windows(dir.len())
+            .any(|w| w.iter().zip(dir.iter()).all(|(a, b)| a == b))
+    });
+    if in_secret_dir {
+        return true;
+    }
+    let Some(name) = parts.last() else {
+        return false;
+    };
+    if SECRET_NAMES.contains(name) || name.ends_with("-key.json") || name.ends_with("_key.json") {
+        return true;
+    }
+    // Every .env variant, including globs and stacked suffixes such as
+    // .env.production.local. Templates are exempted by `is_harmless`.
+    if *name == ".env" || name.starts_with(".env.") || name.starts_with(".env*") {
+        return true;
+    }
+    if name.contains("credential") || name.contains("secret") || name.contains("token") {
+        let extension = name.rsplit_once('.').map_or("", |(_, e)| e);
+        let extension = extension.trim_end_matches('*');
+        return DATA_EXTENSIONS.contains(&extension) && !name.starts_with('.') || *name == ".token";
+    }
+    false
+}
+
+/// Words in a command or path that could name a file.
+fn path_tokens(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '=' | '<' | '>' | '(' | ')' | '|' | ';' | '&' | ',' | '`' | '$' | '{' | '}'
+            )
+    })
+    .filter(|t| !t.is_empty())
+}
+
+fn names_secret(text: &str) -> bool {
+    sensitive_re().is_match(text) || path_tokens(text).any(component_is_secret)
 }
 
 /// True if `text` names a file that holds secrets.
 pub fn is_sensitive(text: &str) -> bool {
-    sensitive_re().is_match(text) && !is_harmless(text)
+    if !names_secret(text) {
+        return false;
+    }
+    // Only exempt when nothing sensitive remains once the harmless names are gone.
+    let stripped = harmless_re().replace_all(text, "");
+    names_secret(&stripped)
 }
 
 /// True if `text` names a file or process that controls Halda or an agent's hooks.
@@ -192,6 +295,18 @@ mod tests {
             "config/secrets.yaml",
             ".git-credentials",
             "terraform.tfstate",
+            "~/.config/gcloud/application_default_credentials.json",
+            ".env.production.local",
+            ".env*",
+            "~/.aws/cred*",
+            "~/.aws",
+            "~/.my.cnf",
+            "~/.config/gh/hosts.yml",
+            "/proc/self/environ",
+            "~/.databricks/token",
+            "~/.config/firebase/key.json",
+            "prod-sa-key.json",
+            "db_secret.txt",
         ] {
             assert!(is_sensitive(p), "{p} should be sensitive");
         }
@@ -207,6 +322,12 @@ mod tests {
             "environment.ts",
             "credentials_test.rs",
             "docs/keys.md",
+            "src/token.rs",
+            "tokenizer.py",
+            "secret_handling.md",
+            "keyboard.json",
+            ".env.sample",
+            "src/credentials/mod.rs",
         ] {
             assert!(!is_sensitive(p), "{p} should not be sensitive");
         }

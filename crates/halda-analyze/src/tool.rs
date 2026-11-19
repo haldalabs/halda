@@ -543,6 +543,44 @@ fn mcp_tool(request: &ActionRequest, rest: &str) -> Analysis {
             ),
         );
     }
+    // A read from a secret store, or of a secret file, brings a secret into the
+    // agent's context however harmless the tool's name sounds.
+    let tool_lower = tool.to_ascii_lowercase();
+    let secret_store = [
+        "vault",
+        "secret",
+        "onepassword",
+        "1password",
+        "op_",
+        "bitwarden",
+        "lastpass",
+        "keychain",
+        "keyvault",
+        "key_vault",
+        "credential",
+        "password",
+        "passbolt",
+        "doppler",
+        "infisical",
+    ]
+    .iter()
+    .any(|w| server_lower.contains(w) || tool_lower.contains(w));
+    let names_secret_file = request.input.as_object().is_some_and(|map| {
+        map.values()
+            .filter_map(Value::as_str)
+            .any(crate::paths::is_sensitive)
+    });
+    if secret_store || names_secret_file {
+        return result(
+            Risk::Risky,
+            Domain::File,
+            normalized,
+            Signal::new(
+                "secret.read",
+                format!("{server}.{tool} brings a secret into the agent's context"),
+            ),
+        );
+    }
     if name_is_read_only(tool) {
         return result(
             Risk::Safe,
